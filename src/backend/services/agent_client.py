@@ -910,6 +910,12 @@ class AgentClient:
 
     async def post(self, path: str, timeout: float = None, **kwargs) -> httpx.Response:
         """Make a POST request to the agent."""
+        if path in {"/api/task", "/api/chat"}:
+            raise AgentRequestError(
+                "direct agent execution dispatch is disabled; use the row-owning "
+                "task or chat execution service",
+                status_code=503,
+            )
         return await self._request("POST", path, timeout, **kwargs)
 
     async def put(self, path: str, timeout: float = None, **kwargs) -> httpx.Response:
@@ -945,21 +951,11 @@ class AgentClient:
             AgentNotReachableError: If agent is not reachable
             AgentRequestError: If request fails
         """
-        timeout = timeout or self.CHAT_TIMEOUT
-
-        response = await self.post(
-            "/api/chat",
-            json={"message": message, "stream": stream},
-            timeout=timeout
+        raise AgentRequestError(
+            "direct AgentClient.chat dispatch is disabled; use the row-owning "
+            "chat execution service",
+            status_code=503,
         )
-
-        # Check for error response and extract detailed error message
-        if response.status_code >= 400:
-            error_msg = self._extract_error_detail(response)
-            raise AgentRequestError(error_msg, status_code=response.status_code)
-
-        result = response.json()
-        return self._parse_chat_response(result)
 
     async def task(
         self,
@@ -991,23 +987,38 @@ class AgentClient:
         """
         timeout = timeout or self.CHAT_TIMEOUT
 
-        payload = {"message": message, "timeout_seconds": int(timeout)}
-        if execution_id:
-            payload["execution_id"] = execution_id
+        # One row-owning path for voice and any future AgentClient callers.
+        # The task service uses agent_auth directly and therefore does not
+        # recurse through this client.
+        from services.task_execution_service import get_task_execution_service
 
-        response = await self.post(
-            "/api/task",
-            json=payload,
-            timeout=timeout + 10  # Add buffer to agent timeout
+        result = await get_task_execution_service().execute_task(
+            agent_name=self.agent_name,
+            message=message,
+            triggered_by="agent_client",
+            timeout_seconds=int(timeout),
+            execution_id=execution_id,
         )
-
-        # Check for error response and extract detailed error message
-        if response.status_code >= 400:
-            error_msg = self._extract_error_detail(response)
-            raise AgentRequestError(error_msg, status_code=response.status_code)
-
-        result = response.json()
-        return self._parse_task_response(result)
+        if result.status != "success":
+            raise AgentRequestError(result.error or result.status, status_code=502)
+        raw = dict(result.raw_response or {})
+        raw.setdefault("response", result.response)
+        return AgentChatResponse(
+            response_text=result.response,
+            metrics=AgentChatMetrics(
+                context_used=int(result.context_used or 0),
+                context_max=int(result.context_max or 0),
+                context_percent=(
+                    float(result.context_used or 0) / float(result.context_max) * 100
+                    if result.context_max
+                    else 0.0
+                ),
+                cost_usd=result.cost,
+                tool_calls_json=None,
+                execution_log_json=result.execution_log,
+            ),
+            raw_response=raw,
+        )
 
     def _parse_task_response(self, result: Dict[str, Any]) -> AgentChatResponse:
         """

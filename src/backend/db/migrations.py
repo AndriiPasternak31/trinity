@@ -3446,6 +3446,106 @@ def _migrate_portal_chat_state(cursor, conn):
     conn.commit()
 
 
+def _migrate_agent_freeze_leases(cursor, conn):
+    """Install the durable agent execution fence and its DB guards."""
+    _safe_add_column(
+        cursor,
+        "schedule_executions",
+        "dispatch_attempt_count",
+        "ALTER TABLE schedule_executions "
+        "ADD COLUMN dispatch_attempt_count INTEGER NOT NULL DEFAULT 0",
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_freeze_leases (
+            id TEXT PRIMARY KEY,
+            agent_name TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            claimed_at TEXT,
+            claim_expires_at TEXT,
+            claimed_by TEXT,
+            released_at TEXT,
+            released_by TEXT,
+            schedule_revision TEXT NOT NULL
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_freeze_one_active "
+        "ON agent_freeze_leases(agent_name) WHERE active = 1"
+    )
+    # Recreate the triggers so an installation that briefly ran an earlier
+    # #113 candidate cannot retain a weaker, status-only dispatch fence.
+    for trigger_name in (
+        "agent_freeze_block_enabled_schedule_insert",
+        "agent_freeze_block_schedule_enable",
+        "agent_freeze_block_execution_insert",
+        "agent_freeze_block_execution_redispatch",
+        "agent_freeze_block_execution_wire_attempt",
+    ):
+        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+    for ddl in (
+        """
+        CREATE TRIGGER IF NOT EXISTS agent_freeze_block_enabled_schedule_insert
+        BEFORE INSERT ON agent_schedules
+        WHEN NEW.enabled = 1 AND EXISTS (
+            SELECT 1 FROM agent_freeze_leases
+            WHERE agent_name = NEW.agent_name AND active = 1
+        ) BEGIN
+            SELECT RAISE(ABORT, 'agent freeze lease blocks schedule enable');
+        END
+        """,
+        """
+        CREATE TRIGGER agent_freeze_block_execution_wire_attempt
+        BEFORE UPDATE OF dispatch_attempt_count ON schedule_executions
+        WHEN COALESCE(NEW.status, '') NOT IN ('success', 'failed', 'cancelled', 'skipped')
+          AND EXISTS (
+            SELECT 1 FROM agent_freeze_leases
+            WHERE agent_name = NEW.agent_name AND active = 1
+        ) BEGIN
+            SELECT RAISE(ABORT, 'agent freeze lease blocks execution dispatch');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS agent_freeze_block_schedule_enable
+        BEFORE UPDATE OF enabled ON agent_schedules
+        WHEN NEW.enabled = 1 AND EXISTS (
+            SELECT 1 FROM agent_freeze_leases
+            WHERE agent_name = NEW.agent_name AND active = 1
+        ) BEGIN
+            SELECT RAISE(ABORT, 'agent freeze lease blocks schedule enable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS agent_freeze_block_execution_insert
+        BEFORE INSERT ON schedule_executions
+        WHEN COALESCE(NEW.status, '') NOT IN ('success', 'failed', 'cancelled', 'skipped')
+          AND EXISTS (
+            SELECT 1 FROM agent_freeze_leases
+            WHERE agent_name = NEW.agent_name AND active = 1
+        ) BEGIN
+            SELECT RAISE(ABORT, 'agent freeze lease blocks execution dispatch');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS agent_freeze_block_execution_redispatch
+        BEFORE UPDATE OF status ON schedule_executions
+        WHEN NEW.status IS NOT OLD.status
+          AND COALESCE(NEW.status, '') NOT IN ('success', 'failed', 'cancelled', 'skipped')
+          AND EXISTS (
+            SELECT 1 FROM agent_freeze_leases
+            WHERE agent_name = NEW.agent_name AND active = 1
+        ) BEGIN
+            SELECT RAISE(ABORT, 'agent freeze lease blocks execution dispatch');
+        END
+        """,
+    ):
+        cursor.execute(ddl)
+    conn.commit()
+
+
 MIGRATIONS = [
     ("agent_sharing", _migrate_agent_sharing_table),
     ("schedule_executions_observability", _migrate_schedule_executions_observability),
@@ -3556,4 +3656,5 @@ MIGRATIONS = [
     ("client_portal_tables_to_oss", _migrate_client_portal_tables_to_oss),
     ("portal_session_resume", _migrate_portal_session_resume),
     ("portal_chat_state", _migrate_portal_chat_state),
+    ("agent_freeze_leases", _migrate_agent_freeze_leases),
 ]

@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Optional, List, Dict
 
-from sqlalchemy import select, insert, update, and_
+from sqlalchemy import select, insert, update, and_, or_
 
 from ..engine import get_engine
 from ..query_helpers import latest_per_group
@@ -281,6 +281,40 @@ class ScheduleExecutionsMixin:
                 .values(claude_session_id=sentinel)
             )
             return result.rowcount > 0
+
+    def authorize_execution_dispatch(
+        self, execution_id: str, agent_name: str
+    ) -> bool:
+        """Atomically authorize one physical agent HTTP attempt.
+
+        ``dispatch_attempt_count`` is guarded by the agent-freeze database
+        trigger.  Its increment is deliberately committed before the wire
+        call: if this transaction wins, the execution remains nonterminal and
+        therefore prevents a zero-count freeze claim; if lease creation wins,
+        the trigger aborts this update and the caller must not touch the wire.
+        Every transport retry must invoke this method independently.
+        """
+        terminal = ("success", "failed", "cancelled", "skipped")
+        with get_engine().begin() as conn:
+            result = conn.execute(
+                update(schedule_executions)
+                .where(
+                    and_(
+                        schedule_executions.c.id == execution_id,
+                        schedule_executions.c.agent_name == agent_name,
+                        or_(
+                            schedule_executions.c.status.is_(None),
+                            schedule_executions.c.status.not_in(terminal),
+                        ),
+                    )
+                )
+                .values(
+                    dispatch_attempt_count=(
+                        schedule_executions.c.dispatch_attempt_count + 1
+                    )
+                )
+            )
+            return result.rowcount == 1
 
     def resume_session_belongs_to_user(
         self, agent_name: str, claude_session_id: str, user_id: int

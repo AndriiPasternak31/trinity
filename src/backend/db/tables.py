@@ -262,12 +262,35 @@ schedule_executions = Table(
     # retry_count (#678 reader-race). Incremented on each lease-expired re-queue;
     # at MAX_REDELIVERY the row is poison-parked to the operator queue.
     Column("redelivery_count", Integer),
+    # #113 — incremented transactionally immediately before every physical
+    # agent HTTP attempt. The freeze trigger guards this column so a wire call
+    # either precedes lease creation and remains exactly countable as
+    # nonterminal, or is rejected after the lease wins serialization.
+    Column("dispatch_attempt_count", Integer, nullable=False, default=0),
     Column("source_channel", Text),           # ent#117: originating channel for voice-reply delivery
     Column("source_channel_chat_id", Text),   # ent#117: channel destination (chat/channel id)
     Column("source_channel_thread", Text),    # ent#117: channel thread id (nullable)
     # ent#265: binding-agent for channel report-back — the agent whose channel
     # binding owns this execution's INHERITED context (NULL = executing agent).
     Column("source_channel_agent", Text),
+)
+
+agent_freeze_leases = Table(
+    "agent_freeze_leases",
+    metadata,
+    Column("id", Text, primary_key=True),
+    Column("agent_name", Text, nullable=False),
+    Column("active", Integer, nullable=False),
+    Column("created_at", Text, nullable=False),
+    Column("created_by", Text, nullable=False),
+    Column("claimed_at", Text),
+    Column("claim_expires_at", Text),
+    Column("claimed_by", Text),
+    Column("released_at", Text),
+    Column("released_by", Text),
+    # Immutable digest captured after create_freeze disables all schedules.
+    # It is the freeze epoch bound by CUTOVER, never a live mutable digest.
+    Column("schedule_revision", Text, nullable=False),
 )
 
 agent_loops = Table(

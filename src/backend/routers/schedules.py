@@ -10,7 +10,6 @@ defined BEFORE dynamic routes like /{name}/schedules to avoid FastAPI matching
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from typing import List, Optional
-from datetime import datetime
 import json
 import os
 import logging
@@ -20,6 +19,8 @@ from models import (
     AgentSchedulesSummaryResponse,
     ExecutionResponse,
     ExecutionSummary,
+    FreezeClaimRequest,
+    FreezeReleaseRequest,
     ScheduleAnalyticsResponse,
     ScheduleResponse,
     ScheduleUpdateRequest,
@@ -28,14 +29,12 @@ from models import (
 )
 from dependencies import (
     get_current_user,
-    get_authorized_agent,
     AuthorizedAgent,
     OwnedAgent,
-    CurrentUser,
     assert_admin,
     assert_agent_access,
 )
-from database import db, Schedule, ScheduleCreate, ScheduleExecution
+from database import db, ScheduleCreate
 from services.platform_audit_service import platform_audit_service, AuditEventType
 from services.schedule_validation import (
     ScheduleValidationError,
@@ -43,6 +42,18 @@ from services.schedule_validation import (
     validate_timezone,
 )
 from services.webhook_signature import SIGNATURE_HEADER as WEBHOOK_SIGNATURE_HEADER
+from services.agent_freeze_service import (
+    AgentFreezeConflict,
+    AgentFreezeCredentialError,
+    AgentFreezeNotDrained,
+    AgentFreezeNotFound,
+    authorize_cutover_credential,
+    claim_freeze,
+    create_freeze,
+    get_active_freeze,
+    is_agent_frozen,
+    release_freeze,
+)
 
 _ANALYTICS_VALID_WINDOWS = frozenset({24, 168, 720})  # #868
 # #1115: Overview/Schedules-tab scorecard windows → hours (matches the #1107
@@ -55,6 +66,39 @@ logger = logging.getLogger(__name__)
 SCHEDULER_URL = os.getenv("SCHEDULER_URL", "http://scheduler:8001")
 
 router = APIRouter(prefix="/api/agents", tags=["schedules"])
+
+
+def _require_cutover_scope(
+    name: str,
+    authorization: Optional[str] = Header(default=None),
+) -> str:
+    """Authenticate the read/claim-only credential used by one agent container."""
+    try:
+        return authorize_cutover_credential(name, authorization)
+    except AgentFreezeCredentialError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+def _freeze_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, AgentFreezeNotFound):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    if isinstance(exc, AgentFreezeNotDrained):
+        return HTTPException(
+            status_code=status.HTTP_423_LOCKED,
+            detail={
+                "message": str(exc),
+                "nonterminal_count": exc.nonterminal_count,
+            },
+        )
+    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+def _reject_frozen_agent(agent_name: str) -> None:
+    if is_agent_frozen(agent_name):
+        raise HTTPException(
+            status_code=status.HTTP_423_LOCKED,
+            detail="agent freeze lease blocks this operation",
+        )
 
 
 # =============================================================================
@@ -91,11 +135,77 @@ async def get_scheduler_status(
         logger.warning(f"Cannot connect to scheduler at {SCHEDULER_URL}")
         return {"running": False, "error": "Scheduler unavailable"}
     except httpx.TimeoutException:
-        logger.warning(f"Timeout connecting to scheduler")
+        logger.warning("Timeout connecting to scheduler")
         return {"running": False, "error": "Scheduler timeout"}
 
 
 # Schedule CRUD Endpoints
+
+
+@router.post("/{name}/freeze-lease")
+async def create_agent_freeze_lease(
+    name: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Admin-only: establish the durable fence and disable all schedules."""
+    assert_admin(current_user)
+    try:
+        return create_freeze(name, created_by=current_user.username).to_dict()
+    except (AgentFreezeNotFound, AgentFreezeConflict) as exc:
+        raise _freeze_http_error(exc) from exc
+
+
+@router.get("/{name}/freeze-lease")
+async def read_agent_freeze_lease(
+    name: str,
+    cutover_agent: str = Depends(_require_cutover_scope),
+):
+    assert cutover_agent == name
+    lease = get_active_freeze(name)
+    if lease is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="active freeze lease not found",
+        )
+    return lease.to_dict()
+
+
+@router.post("/{name}/freeze-lease/claim")
+async def claim_agent_freeze_lease(
+    request: FreezeClaimRequest,
+    name: str,
+    cutover_agent: str = Depends(_require_cutover_scope),
+):
+    """Read/claim surface usable by an agent-scoped credential."""
+    assert cutover_agent == name
+    try:
+        return claim_freeze(
+            name,
+            request.lease_id,
+            claimed_by=f"cutover:{cutover_agent}",
+            claim_seconds=request.claim_seconds,
+        ).to_dict()
+    except (AgentFreezeNotFound, AgentFreezeNotDrained, AgentFreezeConflict) as exc:
+        raise _freeze_http_error(exc) from exc
+
+
+@router.post("/{name}/freeze-lease/release")
+async def release_agent_freeze_lease(
+    name: str,
+    request: FreezeReleaseRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Admin-only second approval. Schedules deliberately remain disabled."""
+    assert_admin(current_user)
+    try:
+        return release_freeze(
+            name,
+            request.lease_id,
+            released_by=current_user.username,
+            approve_release=request.approve_release,
+        ).to_dict()
+    except (AgentFreezeNotFound, AgentFreezeConflict) as exc:
+        raise _freeze_http_error(exc) from exc
 
 
 def _enforce_timeout_below_agent_cap(agent_name: str, requested_seconds: int) -> None:
@@ -165,6 +275,8 @@ async def create_schedule(
     assert_agent_access(current_user, name)
     if not db.is_agent_live(name):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+    if schedule_data.enabled:
+        _reject_frozen_agent(name)
 
     # trinity-enterprise#69: cron on a dying agent is a footgun — an ephemeral
     # agent's whole lifecycle is shorter than most cron cadences, and its
@@ -361,6 +473,8 @@ async def update_schedule(
 
     # Build updates dict — use exclude_unset to distinguish "not provided" from "explicitly set to null"
     update_dict = updates.model_dump(exclude_unset=True)
+    if update_dict.get("enabled") is True:
+        _reject_frozen_agent(name)
 
     updated_schedule = db.update_schedule(schedule_id, current_user.username, update_dict)
     if not updated_schedule:
@@ -419,6 +533,7 @@ async def enable_schedule(
         )
 
     # Update database - dedicated scheduler syncs automatically
+    _reject_frozen_agent(name)
     db.set_schedule_enabled(schedule_id, True)
 
     return {"status": "enabled", "schedule_id": schedule_id}
@@ -475,6 +590,8 @@ async def trigger_schedule(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Schedule not found"
         )
+
+    _reject_frozen_agent(name)
 
     # #1970: the authenticated caller is in scope HERE and nowhere downstream —
     # the scheduler hop carried only the schedule id, so every manually

@@ -485,6 +485,49 @@ async def agent_post_with_retry(
     for attempt in range(max_retries):
         try:
             async with acquire_agent_call_slot(agent_name):
+                execution_id = payload.get("execution_id")
+                if execution_id:
+                    # #113: this is the authoritative pre-wire fence, and it is
+                    # intentionally inside the retry loop. A failed or frozen
+                    # update must abort before *each* physical HTTP attempt.
+                    try:
+                        authorized = db.authorize_execution_dispatch(
+                            str(execution_id), agent_name
+                        )
+                    except Exception as exc:
+                        # The database is the execution fence.  Never downgrade a
+                        # failed authorization (including a freeze trigger winning
+                        # the race) to a warning or attempt the wire call anyway.
+                        request = httpx.Request("POST", agent_url)
+                        response = httpx.Response(
+                            423,
+                            request=request,
+                            json={
+                                "detail":
+                                    "authoritative dispatch authorization refused: "
+                                    f"{type(exc).__name__}"
+                            },
+                        )
+                        raise httpx.HTTPStatusError(
+                            "authoritative dispatch authorization refused",
+                            request=request,
+                            response=response,
+                        ) from exc
+                    if not authorized:
+                        request = httpx.Request("POST", agent_url)
+                        response = httpx.Response(
+                            409,
+                            request=request,
+                            json={
+                                "detail":
+                                    "execution is missing or terminal; refusing agent dispatch"
+                            },
+                        )
+                        raise httpx.HTTPStatusError(
+                            "execution is missing or terminal; refusing agent dispatch",
+                            request=request,
+                            response=response,
+                        )
                 async with agent_httpx_client(agent_name, timeout=timeout) as client:
                     response = await client.post(agent_url, json=payload)
                     return response

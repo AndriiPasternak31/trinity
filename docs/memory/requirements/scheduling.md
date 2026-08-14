@@ -40,6 +40,31 @@
 - **Key Features**: SIGINT/SIGKILL flow, queue release, activity tracking
 - **Flow**: `docs/memory/feature-flows/execution-termination.md`
 
+### 10.4.0 Agent Freeze Leases
+- **Status**: Implemented (2026-08-13)
+- **Description**: An operator can establish a durable, agent-scoped execution
+  freeze for irreversible external maintenance. Creating the lease atomically
+  disables every live schedule for the agent. While it is active, the database
+  rejects schedule re-enable and rejects creation or re-dispatch of every
+  nonterminal execution, independent of whether the producer is cron, manual
+  trigger, API/MCP, retry, queued work, webhook, loop, fan-out, or collaboration.
+- **Atomic boundary**: the lease, schedule disable, exact nonterminal count, and
+  dispatch guards are database state. A caller-side lock or a bounded execution
+  listing is not an execution fence. Both SQLite and PostgreSQL migrations install
+  equivalent constraints.
+- **Claim protocol**: the dedicated CUTOVER principal may read a lease and claim it only
+  when the exact count of statuses outside `success`, `failed`, `cancelled`, and
+  `skipped` is zero. A claim returns the lease id plus a canonical SHA-256 schedule
+  revision/digest. A claimed lease cannot be released before its claim deadline.
+  Claim expiry never thaws the agent; an admin must separately submit explicit
+  release approval.
+- **Authority**: create and release are admin operations, and release must come
+  from an operator distinct from the lease creator/claimer. The backend binds
+  `TRINITY_CUTOVER_TOKEN` to exactly `TRINITY_CUTOVER_AGENT`; that credential is
+  accepted only by the read/claim endpoints, so it cannot enable schedules or
+  release the freeze. Both values must be configured in the backend, and the
+  matching token only is injected into the named container.
+
 ### 10.4.1 Signal-Exit Classification Correctness (#904)
 - **Status**: ✅ Implemented (2026-05-21)
 - **GitHub Issue**: #904

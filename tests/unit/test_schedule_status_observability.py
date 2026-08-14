@@ -289,6 +289,7 @@ _EXPECTED_UPDATE_SITES = {
     "claim_next_queued",
     # --- non-status updates: write other columns, `status` untouched ----------
     "mark_execution_dispatched",           # sets claude_session_id
+    "authorize_execution_dispatch",        # increments the freeze-guarded physical-attempt counter
     "update_business_status",              # sets business_status
     "prune_execution_logs",                # nulls execution_log AND tool_calls (#1741 — a transcript copy must not outlive the transcript)
     "resummarize_legacy_tool_calls",       # #1741: rewrites tool_calls to the summary shape; `status` untouched (no status in the WHERE either)

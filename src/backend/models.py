@@ -2961,6 +2961,20 @@ class ScheduleUpdateRequest(BaseModel):
     validation_timeout_seconds: Optional[int] = None
 
 
+class FreezeClaimRequest(BaseModel):
+    """Scoped CUTOVER request to claim an operator-created freeze lease."""
+
+    lease_id: str
+    claim_seconds: int = Field(default=900, ge=60, le=3600)
+
+
+class FreezeReleaseRequest(BaseModel):
+    """Second-operator request to release (but not re-enable) a freeze."""
+
+    lease_id: str
+    approve_release: bool = False
+
+
 class ScheduleResponse(BaseModel):
     """Response model for schedule data."""
     id: str

@@ -97,6 +97,9 @@ AGENT_REFS: List[AgentRef] = [
     # --- Sharing, scheduling, execution history ----------------------------
     AgentRef("agent_sharing",                "agent_name",        Policy.CASCADE),
     AgentRef("agent_schedules",              "agent_name",        Policy.CASCADE),
+    # A freeze has no meaning after its agent is purged. Rename must also re-key
+    # it so the active DB fence continues to protect the renamed container.
+    AgentRef("agent_freeze_leases",          "agent_name",        Policy.CASCADE),
     AgentRef("schedule_executions",          "agent_name",        Policy.KEEP),
     # ent#265: binding-agent for channel report-back. KEEP mirrors the row it
     # rides on (same #772 90-day terminal-row sweep); cascade_rename touches ALL

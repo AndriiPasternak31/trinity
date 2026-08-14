@@ -1414,6 +1414,9 @@ class DatabaseManager:
     def mark_execution_dispatched(self, execution_id: str, async_dispatch: bool = False) -> bool:
         return self._schedule_ops.mark_execution_dispatched(execution_id, async_dispatch)
 
+    def authorize_execution_dispatch(self, execution_id: str, agent_name: str) -> bool:
+        return self._schedule_ops.authorize_execution_dispatch(execution_id, agent_name)
+
     def resume_session_belongs_to_user(
         self, agent_name: str, claude_session_id: str, user_id: int
     ) -> bool:

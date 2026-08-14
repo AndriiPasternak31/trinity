@@ -732,42 +732,21 @@ async def get_agent_intro(
 
     agent_name = link["agent_name"]
 
-    # Execute intro prompt via parallel task endpoint
-    try:
-        async with agent_httpx_client(agent_name, timeout=120.0) as client:
-            response = await client.post(
-                f"http://agent-{agent_name}:8000/api/task",
-                json={
-                    "message": INTRO_PROMPT,
-                    "timeout_seconds": 60
-                }
-            )
-
-            if response.status_code != 200:
-                logger.error(f"Agent intro failed: {response.status_code} - {response.text}")
-                raise HTTPException(
-                    status_code=502,
-                    detail="Failed to get introduction. Please try again."
-                )
-
-            result = response.json()
-
-            return {
-                "intro": result.get("response", result.get("result", ""))
-            }
-
-    except httpx.TimeoutException:
-        logger.error(f"Agent intro request timed out for {link['agent_name']}")
-        raise HTTPException(
-            status_code=504,
-            detail="Request timed out. Please try again."
-        )
-    except httpx.RequestError as e:
-        logger.error(f"Agent intro request failed: {e}")
+    # Route through the row-owning task service. A direct /api/task POST can
+    # cross an active economic freeze because it has no countable execution.
+    result = await get_task_execution_service().execute_task(
+        agent_name=agent_name,
+        message=INTRO_PROMPT,
+        triggered_by="public_intro",
+        timeout_seconds=60,
+    )
+    if result.status != "success":
+        logger.error("Agent intro failed: %s", result.error or result.status)
         raise HTTPException(
             status_code=502,
-            detail="Failed to reach the agent. Please try again."
+            detail="Failed to get introduction. Please try again.",
         )
+    return {"intro": result.response}
 
 
 @router.get("/history/{token}", response_model=PublicChatHistoryResponse)
